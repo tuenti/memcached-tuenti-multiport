@@ -189,6 +189,7 @@ static void settings_init(void) {
     settings.factor = 1.25;
     settings.chunk_size = 48;         /* space for a modest key and value */
     settings.num_threads = 4;         /* N workers */
+    settings.num_ports = 1;           /* N ports */
     settings.prefix_delimiter = ':';
     settings.detail_enabled = 0;
     settings.reqs_per_event = 20;
@@ -3901,8 +3902,12 @@ static int server_socket(int port, enum network_transport transport,
 
         if (IS_UDP(transport)) {
             int c;
+            /* one port => assign that socket to all threads
+             * more than one port => assign one socket per thread
+             */
+            int num_threads = settings.num_ports > 1 ? 1 : settings.num_threads;
 
-            for (c = 0; c < settings.num_threads; c++) {
+            for (c = 0; c < num_threads; c++) {
                 /* this is guaranteed to hit all threads because we round-robin */
                 dispatch_conn_new(sfd, conn_read, EV_READ | EV_PERSIST,
                                   UDP_READ_BUFFER_SIZE, transport);
@@ -4044,6 +4049,7 @@ static void usage(void) {
     printf(PACKAGE " " VERSION "\n");
     printf("-p <num>      TCP port number to listen on (default: 11211)\n"
            "-U <num>      UDP port number to listen on (default: 11211, 0 is off)\n"
+           "-N <num>      Number of ports to listen on (default: 1)\n"
            "-s <file>     UNIX socket path to listen on (disables network support)\n"
            "-a <mask>     access mask for UNIX socket, in octal (default: 0700)\n"
            "-l <ip_addr>  interface to listen on (default: INADDR_ANY, all addresses)\n"
@@ -4286,6 +4292,7 @@ int main (int argc, char **argv) {
           "p:"  /* TCP port number to listen on */
           "s:"  /* unix socket path to listen on */
           "U:"  /* UDP port number to listen on */
+          "N:"  /* number of ports to to listen on */
           "m:"  /* max memory to use for items in megabytes */
           "M"   /* return error on memory exhausted */
           "c:"  /* max simultaneous connections */
@@ -4315,6 +4322,9 @@ int main (int argc, char **argv) {
             settings.access= strtol(optarg,NULL,8);
             break;
 
+        case 'N':
+            settings.num_ports = atoi(optarg);
+            break;
         case 'U':
             settings.udpport = atoi(optarg);
             udp_specified = true;
@@ -4627,8 +4637,9 @@ int main (int argc, char **argv) {
 
     /* create the listening socket, bind it, and init */
     if (settings.socketpath == NULL) {
-        int udp_port;
-
+        int p;
+        int tcp_port = settings.port;
+        int udp_port = settings.udpport ? settings.udpport : settings.port;
         const char *portnumber_filename = getenv("MEMCACHED_PORT_FILENAME");
         char temp_portnumber_filename[PATH_MAX];
         FILE *portnumber_file = NULL;
@@ -4645,29 +4656,29 @@ int main (int argc, char **argv) {
             }
         }
 
-        errno = 0;
-        if (settings.port && server_socket(settings.port, tcp_transport,
-                                           portnumber_file)) {
-            vperror("failed to listen on TCP port %d", settings.port);
-            exit(EX_OSERR);
+        for (p = 0; p < settings.num_ports; p++) {
+            errno = 0;
+            if (settings.port && server_socket(tcp_port + p, tcp_transport,
+                                               portnumber_file)) {
+                vperror("failed to listen on TCP port %d", settings.port + p);
+                exit(EX_OSERR);
+            }
+
+            /*
+             * initialization order: first create the listening sockets
+             * (may need root on low ports), then drop root if needed,
+             * then daemonise if needed, then init libevent (in some cases
+             * descriptors created by libevent wouldn't survive forking).
+             */
+
+            /* create the UDP listening socket and bind it */
+            errno = 0;
+            if (settings.udpport && server_socket(udp_port + p, udp_transport,
+                                                  portnumber_file)) {
+                vperror("failed to listen on UDP port %d", udp_port + p);
+                exit(EX_OSERR);
+            }
         }
-
-        /*
-         * initialization order: first create the listening sockets
-         * (may need root on low ports), then drop root if needed,
-         * then daemonise if needed, then init libevent (in some cases
-         * descriptors created by libevent wouldn't survive forking).
-         */
-        udp_port = settings.udpport ? settings.udpport : settings.port;
-
-        /* create the UDP listening socket and bind it */
-        errno = 0;
-        if (settings.udpport && server_socket(settings.udpport, udp_transport,
-                                              portnumber_file)) {
-            vperror("failed to listen on UDP port %d", settings.udpport);
-            exit(EX_OSERR);
-        }
-
         if (portnumber_file) {
             fclose(portnumber_file);
             rename(temp_portnumber_filename, portnumber_filename);
